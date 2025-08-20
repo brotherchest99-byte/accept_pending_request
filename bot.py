@@ -150,7 +150,6 @@ def get_owner_menu_kb():
             InlineKeyboardButton(text="🗑 Clear Database", callback_data="owner_clear_db"),
             InlineKeyboardButton(text="⚙️ Channel Control", callback_data="owner_channels")
         ],
-        [InlineKeyboardButton(text="⬅️ Back to User Menu", callback_data="back_to_user_menu")]
     ])
     
 def get_add_bot_menu_kb():
@@ -343,6 +342,19 @@ async def handle_check_join_status(callback_query: types.CallbackQuery):
             show_alert=True
         )
 
+@dp.callback_query(F.data == "back_to_add_menu")
+async def handle_back_to_add_menu(callback_query: types.CallbackQuery):
+    """Handles the 'Back' button, returning to the add bot menu."""
+    user = callback_query.from_user
+    text = (
+        f"🎉 Welcome back, {hbold(user.first_name)}!\n\n"
+        "You're all set! You can now add this bot to your channels or groups to manage join requests.\n\n"
+        "Select an option below to get started:"
+    )
+    await callback_query.message.edit_text(text, reply_markup=get_add_bot_menu_kb())
+    await callback_query.answer()
+
+
 @dp.callback_query(F.data == "add_to_channel")
 async def handle_add_to_channel(callback_query: types.CallbackQuery):
     """Provides instructions for adding the bot to a channel."""
@@ -357,7 +369,29 @@ async def handle_add_to_channel(callback_query: types.CallbackQuery):
     )
     deep_link_url = f"https://t.me/{bot_username}?startchannel&admin=invite_users"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Add to Channel Now", url=deep_link_url)]
+        [InlineKeyboardButton(text="➕ Add to Channel Now", url=deep_link_url)],
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="back_to_add_menu")]
+    ])
+    await callback_query.message.edit_text(text, reply_markup=keyboard)
+    await callback_query.answer()
+
+@dp.callback_query(F.data == "add_to_group")
+async def handle_add_to_group(callback_query: types.CallbackQuery):
+    """Provides instructions for adding the bot to a group as an admin."""
+    bot_username = (await bot.get_me()).username
+    text = (
+        "⚙️ To add this bot to your group as an admin:\n\n"
+        "1. Open your group settings.\n"
+        "2. Go to `Administrators` -> `Add Admin`.\n"
+        f"3. Search for `@{bot_username}` and select it.\n"
+        "4. Grant the `Invite Users via Link` permission. This is required to manage join requests.\n"
+        "5. Click the button below for a direct link to start the process."
+    )
+    # This deep link will prompt the user to select a group and grant the specified admin rights.
+    deep_link_url = f"https://t.me/{bot_username}?startgroup=true&admin=invite_users"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Add to Group as Admin", url=deep_link_url)],
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="back_to_add_menu")]
     ])
     await callback_query.message.edit_text(text, reply_markup=keyboard)
     await callback_query.answer()
