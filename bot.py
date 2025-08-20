@@ -12,13 +12,13 @@ from keep_alive import keep_alive
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ChatAction, ParseMode
+from aiogram.enums import ChatAction, ParseMode, ChatMemberStatus
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (BotCommand, BotCommandScopeChat,
                            BotCommandScopeDefault, ChatJoinRequest,
-                           InlineKeyboardButton, InlineKeyboardMarkup, Message)
+                           InlineKeyboardButton, InlineKeyboardMarkup, Message, ChatMemberUpdated)
 from aiogram.utils.markdown import hbold, hitalic, hlink
 
 # --- Configuration ---
@@ -55,7 +55,7 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS managed_channels (
                     channel_id INTEGER PRIMARY KEY,
                     title TEXT,
-                    added_by INTEGER,
+                    added_by INTEGER NOT NULL,
                     add_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -75,6 +75,43 @@ def add_user_to_db(user_id: int, first_name: str, username: str | None):
                 conn.commit()
     except sqlite3.Error as e:
         logger.error(f"Database error while adding user {user_id}: {e}")
+
+def add_managed_channel(channel_id: int, title: str, added_by: int):
+    """Adds or updates a managed channel in the database."""
+    try:
+        with closing(sqlite3.connect(DB_NAME)) as conn:
+            with closing(conn.cursor()) as cursor:
+                cursor.execute(
+                    "INSERT OR REPLACE INTO managed_channels (channel_id, title, added_by) VALUES (?, ?, ?)",
+                    (channel_id, title, added_by),
+                )
+                conn.commit()
+                logger.info(f"Channel {title} ({channel_id}) added/updated by user {added_by}.")
+    except sqlite3.Error as e:
+        logger.error(f"Database error while adding channel {channel_id}: {e}")
+
+def remove_managed_channel(channel_id: int):
+    """Removes a managed channel from the database."""
+    try:
+        with closing(sqlite3.connect(DB_NAME)) as conn:
+            with closing(conn.cursor()) as cursor:
+                cursor.execute("DELETE FROM managed_channels WHERE channel_id = ?", (channel_id,))
+                conn.commit()
+                logger.info(f"Channel {channel_id} removed from management.")
+    except sqlite3.Error as e:
+        logger.error(f"Database error while removing channel {channel_id}: {e}")
+
+def get_channel_manager_id(channel_id: int) -> int | None:
+    """Gets the ID of the user who added the bot to a specific channel."""
+    try:
+        with closing(sqlite3.connect(DB_NAME)) as conn:
+            with closing(conn.cursor()) as cursor:
+                cursor.execute("SELECT added_by FROM managed_channels WHERE channel_id = ?", (channel_id,))
+                result = cursor.fetchone()
+                return result[0] if result else None
+    except sqlite3.Error as e:
+        logger.error(f"Database error while fetching manager for channel {channel_id}: {e}")
+        return None
 
 def get_all_users() -> list[int]:
     """Retrieves all user IDs from the database."""
@@ -131,14 +168,6 @@ def get_main_channel_join_kb():
         [InlineKeyboardButton(text="✅ I have joined!", callback_data="check_join_status")]
     ])
 
-def get_user_menu_kb():
-    """Standard user menu keyboard."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📌 About Bot", callback_data="user_about")],
-        [InlineKeyboardButton(text="📢 Main Channel", url=f"https://t.me/{MAIN_CHANNEL_USERNAME}")],
-        [InlineKeyboardButton(text="❓ Help / FAQ", callback_data="user_help")]
-    ])
-
 def get_owner_menu_kb():
     """Owner-only menu keyboard."""
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -177,6 +206,30 @@ async def log_to_owner(message_text: str):
         except Exception as e:
             logger.error(f"Failed to send log to LOG_CHAT_ID: {e}")
 
+# --- Bot Status Change Handler ---
+@dp.my_chat_member()
+async def on_my_chat_member(update: ChatMemberUpdated):
+    """Handles the bot being added to or removed from a channel."""
+    # Check if the update is for a channel
+    if update.chat.type not in ["channel"]:
+        return
+
+    new_member_status = update.new_chat_member.status
+    
+    # Bot is promoted to administrator
+    if new_member_status == ChatMemberStatus.ADMINISTRATOR:
+        # The user who promoted the bot is in `update.from_user`
+        adder_id = update.from_user.id
+        add_managed_channel(update.chat.id, update.chat.title, adder_id)
+        try:
+            await bot.send_message(adder_id, f"✅ Bot successfully added as admin to the channel '{hbold(update.chat.title)}'. It will now manage join requests for this channel.")
+        except Exception as e:
+            logger.error(f"Could not notify user {adder_id} about successful channel add: {e}")
+
+    # Bot is removed or demoted
+    elif new_member_status in [ChatMemberStatus.LEFT, ChatMemberStatus.KICKED]:
+        remove_managed_channel(update.chat.id)
+
 # --- Command Handlers ---
 @dp.message(CommandStart())
 async def handle_start(message: Message, state: FSMContext):
@@ -209,7 +262,6 @@ async def handle_start(message: Message, state: FSMContext):
 async def handle_owner_menu(message: Message):
     """Displays the owner menu."""
     if str(message.from_user.id) != str(BOT_OWNER_ID):
-        # This check is a failsafe. The command shouldn't even be visible to non-owners.
         return
     await message.answer("🔑 Welcome, Owner! Accessing the control panel.", reply_markup=get_owner_menu_kb())
 
@@ -233,7 +285,13 @@ async def handle_join_request(request: ChatJoinRequest):
         logger.error(f"Failed to send pending message to user {user.id}: {e}")
         await log_to_owner(f"Could not DM user {user.id} ({user.full_name}). They may have blocked the bot.")
 
-    # 2. Notify channel admins with approval/decline buttons
+    # 2. Notify the channel manager and the bot owner
+    manager_id = get_channel_manager_id(chat.id)
+    if not manager_id:
+        logger.warning(f"Could not find a manager for channel {chat.id} in the database.")
+        await log_to_owner(f"⚠️ No manager found for channel {chat.title} ({chat.id}). Cannot process join request for {user.full_name}.")
+        return
+
     admin_notification_text = (
         f"🔔 New Join Request for {hbold(chat.title)}\n\n"
         f"👤 User: {hbold(user.full_name)}\n"
@@ -247,39 +305,48 @@ async def handle_join_request(request: ChatJoinRequest):
         ]
     ])
     
-    # Send notification to the bot owner and potentially other admins
-    # For simplicity, we only notify the BOT_OWNER_ID.
-    # To notify all admins, you'd need to fetch them via `bot.get_chat_administrators(chat.id)`
-    # and store their IDs, which adds complexity.
+    # Send notification to the channel manager
     try:
-        await bot.send_message(BOT_OWNER_ID, admin_notification_text, reply_markup=approval_keyboard)
+        await bot.send_message(manager_id, admin_notification_text, reply_markup=approval_keyboard)
     except Exception as e:
-        logger.error(f"Failed to send join request notification to owner: {e}")
+        logger.error(f"Failed to send join request notification to manager {manager_id}: {e}")
+
+    # Also send to bot owner if the owner is not the manager
+    if str(manager_id) != str(BOT_OWNER_ID):
+        try:
+            await bot.send_message(BOT_OWNER_ID, admin_notification_text, reply_markup=approval_keyboard)
+        except Exception as e:
+            logger.error(f"Failed to send join request notification to owner: {e}")
 
 
 # --- Callback Query Handlers for Join Requests ---
 @dp.callback_query(F.data.startswith("approve_"))
 async def handle_approve_request(callback_query: types.CallbackQuery):
     """Handles the 'Approve' button click."""
-    if str(callback_query.from_user.id) != str(BOT_OWNER_ID):
-        await callback_query.answer("⚠️ This action is restricted to the bot owner.", show_alert=True)
+    _, chat_id_str, user_id_str = callback_query.data.split("_")
+    chat_id, user_id = int(chat_id_str), int(user_id_str)
+
+    manager_id = get_channel_manager_id(chat_id)
+    
+    # Check if the user is either the bot owner or the channel manager
+    allowed_ids = {str(BOT_OWNER_ID)}
+    if manager_id:
+        allowed_ids.add(str(manager_id))
+
+    if str(callback_query.from_user.id) not in allowed_ids:
+        await callback_query.answer("⚠️ This action is restricted to the channel manager or bot owner.", show_alert=True)
         return
 
     await callback_query.answer("Processing approval...")
     
     try:
-        _, chat_id, user_id = callback_query.data.split("_")
-        chat_id, user_id = int(chat_id), int(user_id)
-
         await bot.approve_chat_join_request(chat_id, user_id)
         
         chat = await bot.get_chat(chat_id)
         user = await bot.get_chat(user_id)
 
-        # Notify user of approval
         await bot.send_message(user_id, f"🎉 Approved! Welcome to {hbold(chat.title)}!")
 
-        # Update the admin notification message
         await callback_query.message.edit_text(
             f"✅ Request from {hbold(user.full_name)} for {hbold(chat.title)} was approved by {callback_query.from_user.full_name}."
         )
@@ -293,25 +360,30 @@ async def handle_approve_request(callback_query: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("decline_"))
 async def handle_decline_request(callback_query: types.CallbackQuery):
     """Handles the 'Decline' button click."""
-    if str(callback_query.from_user.id) != str(BOT_OWNER_ID):
-        await callback_query.answer("⚠️ This action is restricted to the bot owner.", show_alert=True)
+    _, chat_id_str, user_id_str = callback_query.data.split("_")
+    chat_id, user_id = int(chat_id_str), int(user_id_str)
+
+    manager_id = get_channel_manager_id(chat_id)
+
+    # Check if the user is either the bot owner or the channel manager
+    allowed_ids = {str(BOT_OWNER_ID)}
+    if manager_id:
+        allowed_ids.add(str(manager_id))
+
+    if str(callback_query.from_user.id) not in allowed_ids:
+        await callback_query.answer("⚠️ This action is restricted to the channel manager or bot owner.", show_alert=True)
         return
 
     await callback_query.answer("Processing decline...")
 
     try:
-        _, chat_id, user_id = callback_query.data.split("_")
-        chat_id, user_id = int(chat_id), int(user_id)
-        
         await bot.decline_chat_join_request(chat_id, user_id)
         
         chat = await bot.get_chat(chat_id)
         user = await bot.get_chat(user_id)
 
-        # Notify user of decline
         await bot.send_message(user_id, f"❌ Your join request for {hbold(chat.title)} was declined.")
         
-        # Update the admin notification message
         await callback_query.message.edit_text(
             f"❌ Request from {hbold(user.full_name)} for {hbold(chat.title)} was declined by {callback_query.from_user.full_name}."
         )
